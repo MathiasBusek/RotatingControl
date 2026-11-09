@@ -1,0 +1,52 @@
+Raspberry Pi deployment for the Nanotec controller GUI
+
+The GUI has a landscape layout designed for 800 x 480 pixels or larger.
+On Linux it starts fullscreen and scales its controls to the screen. The
+actual display resolution and orientation depend on the selected display:
+
+    python nanotec_gui.py
+
+To run in an 800 x 480 window for troubleshooting, use:
+
+    python nanotec_gui.py --windowed
+
+The Exit button closes the app; the Connection tab contains interface and
+NanoJ settings. Cycle stop is not an emergency stop.
+
+1. Use a Raspberry Pi and a 64-bit ARM Linux OS, a supported touchscreen,
+   and a working graphical desktop/session. Nanotec's documentation lists
+   Ubuntu ARM64, but Raspberry Pi OS and a particular Pi model have not yet
+   been validated with this application.
+2. Obtain Nanotec's Linux ARM64 Python NanoLib distribution. The installed
+   Windows amd64 wheel and the Windows .venv cannot run on the Pi. Check that
+   the wheel supports the Pi's Python version and CPU/OS architecture.
+3. Install Python, the venv module and Tk bindings for the chosen OS. On a
+   Debian-family OS, package names are commonly python3, python3-venv and
+   python3-tk. Install any dependencies specified by the NanoLib package.
+4. Copy nanotec_gui.py and the Linux ARM64 wheel to the Pi, create a local
+   environment, and install the wheel. Example, from the application folder:
+
+    python3 -m venv .venv
+    . .venv/bin/activate
+    python -m pip install /path/to/the/nanotec-arm64-wheel.whl
+    python -c 'import tkinter; import nanotec_nanolib; print("Imports OK")'
+    python nanotec_gui.py --fullscreen
+
+   Replace the wheel path with its actual filename. If Tk is unavailable in
+   the venv, ensure the system Python has the Tk bindings installed.
+5. Connect and power the controller. Use NanoLib discovery to identify its
+   actual Linux VCP/USB interface; do not assume the Windows COM4 name.
+   Configure only the permissions needed for that device (the applicable
+   device group or a narrowly scoped udev rule). Check the device node and
+   vendor documentation before selecting a rule; do not run the GUI as root
+   by default.
+6. Test touchscreen calibration, readable layout, GUI feedback, reconnection,
+   and command handling on the Pi. Verify control behavior at the machine
+   before enabling automatic startup. The UI sends cycle requests without
+   acknowledgement from NanoJ; it is not a safety function.
+7. If desired, configure autostart in the Pi's graphical session after the
+   display, user session, USB permissions and connection have been verified.
+
+Useful references:
+https://www.nanotec.com/fileadmin/files/Software/NanoLib/NanoLib-Python_User_Manual_V1.3.4.pdf?1745318048=
+https://www.raspberrypi.com/documentation/accessories/touch-display-2.html

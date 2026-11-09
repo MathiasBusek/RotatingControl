@@ -1,0 +1,51 @@
+Raspberry Pi: start the rotation-control GUI automatically
+==========================================================
+
+These instructions are for Raspberry Pi OS with the labwc desktop. The GUI
+starts after the desktop logs in. It does not automatically connect to the
+controller or start the motor cycle.
+
+The example assumes:
+  GUI:                 ~/rotation-control/nanotec_gui.py
+  Virtual environment: ~/rotation-control/.venv
+
+If your folder has a different name or location, adjust every path below.
+Copy the latest nanotec_gui.py into that folder before continuing.
+
+1. Test the GUI manually from a terminal in the Pi desktop:
+
+   cd ~/rotation-control
+   .venv/bin/python nanotec_gui.py --fullscreen
+
+   Close the GUI with its Exit button after checking it.
+
+2. Configure the Pi to start and log into the desktop:
+
+   Open Preferences > Control Centre > System. Choose To desktop and enable
+   Desktop Auto Login if needed. The GUI can start only after login.
+
+3. Add the GUI to the labwc autostart file:
+
+   mkdir -p ~/.config/labwc
+   nano ~/.config/labwc/autostart
+
+   Add the following single line at the end of the file. Keep existing lines:
+
+   (cd "$HOME/rotation-control" && exec "$HOME/rotation-control/.venv/bin/python" "$HOME/rotation-control/nanotec_gui.py" --fullscreen) >> "$HOME/rotation-control/gui.log" 2>&1 &
+
+   Press Ctrl+O, then Enter to save; press Ctrl+X to exit.
+
+4. Reboot and check:
+
+   sudo reboot
+
+   After desktop login, the GUI should open fullscreen. To inspect its log
+   if it does not start, open a terminal and run:
+
+   cat ~/rotation-control/gui.log
+
+To disable autostart, open ~/.config/labwc/autostart again and remove only
+the line added in step 3.
+
+Raspberry Pi OS configuration documentation:
+https://www.raspberrypi.com/documentation/computers/configuration.html
