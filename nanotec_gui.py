@@ -7,7 +7,6 @@ import sys
 import threading
 import time
 from collections import deque
-from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox
 
@@ -165,16 +164,17 @@ class Connection:
 
 
 class App(tk.Tk):
-    def __init__(self):
+    def __init__(self, fullscreen=False):
         super().__init__()
         self.title("Nanotec motor connection")
-        self.geometry("760x810")
-        self.minsize(700, 760)
         self.conn = Connection()
         self.results = queue.Queue()
         self.busy = False
+        self.active_quiet = False
+        self.pending_action = None
         self.closing = False
         self.feedback_timer = None
+        self.poll_timer = None
         self.feedback_active = False
         self.velocity_samples = deque(maxlen=10)
         self.angle_zero = None
@@ -190,14 +190,24 @@ class App(tk.Tk):
         self.feedback_status = tk.StringVar(value="Connect to start live readings.")
         self.speed1 = tk.StringVar(value="")
         self.speed2 = tk.StringVar(value="")
+        self.symmetric = tk.BooleanVar(value=False)
+        # NanoJ does not expose cycle state; None means it has not been confirmed.
+        self.cycle_request = None
+        self.speed1_rpm = tk.StringVar(value="—")
+        self.speed2_rpm = tk.StringVar(value="—")
+        self.speed1.trace_add("write", self.on_speed1_changed)
+        self.speed2.trace_add("write", lambda *_: self.show_speed_rpm(self.speed2, self.speed2_rpm))
         self.cycle_status = tk.StringVar(value="Connect to read the speed settings.")
 
         # The control screen fits a landscape 800 x 480 display. The Connection
         # tab keeps infrequently used settings away from the motion controls.
-        self.geometry("800x480")
+        screen_width, screen_height = self.winfo_screenwidth(), self.winfo_screenheight()
+        self.ui_scale = max(0.75, min(screen_width / 800, screen_height / 480)) if fullscreen else 1.0
+        self.geometry(f"{screen_width}x{screen_height}" if fullscreen else "800x480")
         self.minsize(640, 420)
         self.configure(bg="#111b29")
-        self.tk.call("tk", "scaling", 1.0)
+        self.tk.call("tk", "scaling", self.ui_scale)
+        px = lambda value: round(value * self.ui_scale)
         style = ttk.Style(self)
         style.theme_use("clam")
         style.configure("TFrame", background="#111b29")
@@ -206,16 +216,21 @@ class App(tk.Tk):
         style.configure("Muted.TLabel", foreground="#9aafc3", font=("Segoe UI", 10))
         style.configure("Value.TLabel", foreground="#ffffff", font=("Segoe UI", 19, "bold"))
         style.configure("Speed.TLabel", foreground="#54d1c6", font=("Segoe UI", 16, "bold"))
-        style.configure("TButton", padding=(12, 10), font=("Segoe UI", 11, "bold"))
+        style.configure("TButton", padding=(px(12), px(10)), font=("Segoe UI", 11, "bold"))
         style.configure("Start.TButton", background="#1b8f78", foreground="white")
         style.map("Start.TButton", background=[("disabled", "#435661"), ("active", "#25aa8e")])
         style.configure("Stop.TButton", background="#a8404f", foreground="white")
         style.map("Stop.TButton", background=[("disabled", "#435661"), ("active", "#c45463")])
+        style.configure("CycleActive.TButton", background="#a8404f", foreground="white", relief="sunken")
+        style.map("CycleActive.TButton", background=[("disabled", "#435661"), ("active", "#c45463")])
+        style.configure("Symmetric.Toolbutton", padding=(px(12), px(10)), font=("Segoe UI", 11, "bold"))
+        style.map("Symmetric.Toolbutton", background=[("selected", "#1b8f78"), ("active", "#526d7d")],
+                  foreground=[("selected", "white")], relief=[("selected", "sunken")])
         style.configure("TNotebook", background="#111b29", borderwidth=0)
-        style.configure("TNotebook.Tab", padding=(18, 7), font=("Segoe UI", 11, "bold"))
+        style.configure("TNotebook.Tab", padding=(px(18), px(7)), font=("Segoe UI", 11, "bold"))
         style.map("TNotebook.Tab", background=[("selected", "#294256")], foreground=[("selected", "white")])
 
-        frame = ttk.Frame(self, padding=(12, 7))
+        frame = ttk.Frame(self, padding=(px(12), px(7)))
         frame.pack(fill="both", expand=True)
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(1, weight=1)
@@ -228,8 +243,8 @@ class App(tk.Tk):
 
         self.pages = ttk.Notebook(frame)
         self.pages.grid(row=1, column=0, sticky="nsew")
-        control = ttk.Frame(self.pages, padding=(8, 7))
-        connection = ttk.Frame(self.pages, padding=(12, 8))
+        control = ttk.Frame(self.pages, padding=(px(8), px(7)))
+        connection = ttk.Frame(self.pages, padding=(px(12), px(8)))
         self.pages.add(control, text="  CONTROL  ")
         self.pages.add(connection, text="  CONNECTION  ")
         self.pages.select(connection)
@@ -249,38 +264,38 @@ class App(tk.Tk):
         speeds.columnconfigure(0, weight=1, uniform="speed")
         speeds.columnconfigure(1, weight=1, uniform="speed")
         self.slider_values = [tk.IntVar(value=80), tk.IntVar(value=5)]
-        self.speed1_box = self.make_speed_slider(speeds, 0, "SPEED 1", self.speed1, self.slider_values[0])
-        self.speed2_box = self.make_speed_slider(speeds, 1, "SPEED 2", self.speed2, self.slider_values[1])
+        self.speed1_box = self.make_speed_slider(speeds, 0, "SPEED 1 · RPM", self.speed1, self.speed1_rpm, self.slider_values[0])
+        self.speed2_box = self.make_speed_slider(speeds, 1, "SPEED 2 · RPM", self.speed2, self.speed2_rpm, self.slider_values[1])
 
         actions = ttk.Frame(control)
         actions.grid(row=2, column=0, sticky="ew", pady=(8, 2))
         for column in range(3): actions.columnconfigure(column, weight=1, uniform="action")
-        self.cycle_start_button = ttk.Button(actions, text="▶  START CYCLE", style="Start.TButton", command=self.start_cycle)
-        self.cycle_start_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
-        self.cycle_stop_button = ttk.Button(actions, text="■  STOP CYCLE", style="Stop.TButton", command=self.stop_cycle)
-        self.cycle_stop_button.grid(row=0, column=1, sticky="ew", padx=3)
+        self.cycle_button = ttk.Button(actions, text="■  STOP CYCLE", style="CycleActive.TButton", command=self.toggle_cycle)
+        self.cycle_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self.symmetric_button = ttk.Checkbutton(actions, text="SYMMETRIC", style="Symmetric.Toolbutton", variable=self.symmetric, command=self.toggle_symmetric)
+        self.symmetric_button.grid(row=0, column=1, sticky="ew", padx=3)
         self.apply_speeds_button = ttk.Button(actions, text="APPLY SPEEDS", command=self.apply_speeds)
         self.apply_speeds_button.grid(row=0, column=2, sticky="ew", padx=(6, 0))
-        ttk.Label(control, textvariable=self.cycle_status, style="Muted.TLabel", wraplength=720).grid(row=3, column=0, sticky="w", pady=(3, 0))
+        ttk.Label(control, textvariable=self.cycle_status, style="Muted.TLabel", wraplength=px(720)).grid(row=3, column=0, sticky="w", pady=(3, 0))
         ttk.Label(control, text="Speeds take effect on the next corresponding segment.", style="Muted.TLabel").grid(row=4, column=0, sticky="w")
 
         connection.columnconfigure(1, weight=1)
         ttk.Label(connection, text="Interface").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
-        self.ports = ttk.Combobox(connection, textvariable=self.port, state="readonly")
+        self.ports = ttk.Combobox(connection, textvariable=self.port, state="readonly", font=("Segoe UI", 11))
         self.ports.grid(row=0, column=1, sticky="ew", pady=4)
         self.find_button = ttk.Button(connection, text="Find interfaces", command=self.find_ports)
         self.find_button.grid(row=0, column=2, padx=(8, 0))
         ttk.Label(connection, text="Baud / parity").grid(row=1, column=0, sticky="w", pady=4)
         settings = ttk.Frame(connection)
         settings.grid(row=1, column=1, sticky="w")
-        self.baud_box = ttk.Combobox(settings, textvariable=self.baud, width=10, state="readonly", values=("7200", "9600", "14400", "19200", "38400", "56000", "57600", "115200", "128000", "256000"))
+        self.baud_box = ttk.Combobox(settings, textvariable=self.baud, width=10, state="readonly", font=("Segoe UI", 11), values=("7200", "9600", "14400", "19200", "38400", "56000", "57600", "115200", "128000", "256000"))
         self.baud_box.pack(side="left")
-        self.parity_box = ttk.Combobox(settings, textvariable=self.parity, width=8, state="readonly", values=("Even", "None", "Odd", "Mark", "Space"))
+        self.parity_box = ttk.Combobox(settings, textvariable=self.parity, width=8, state="readonly", font=("Segoe UI", 11), values=("Even", "None", "Odd", "Mark", "Space"))
         self.parity_box.pack(side="left", padx=8)
         self.open_button = ttk.Button(connection, text="Open interface", command=self.open_port)
         self.open_button.grid(row=1, column=2, sticky="ew", padx=(8, 0))
         ttk.Label(connection, text="Controller").grid(row=2, column=0, sticky="w", pady=4)
-        self.device_box = ttk.Combobox(connection, textvariable=self.device, state="readonly")
+        self.device_box = ttk.Combobox(connection, textvariable=self.device, state="readonly", font=("Segoe UI", 11))
         self.device_box.grid(row=2, column=1, sticky="ew")
         self.scan_button = ttk.Button(connection, text="Scan devices", command=self.scan)
         self.scan_button.grid(row=2, column=2, padx=(8, 0))
@@ -298,29 +313,57 @@ class App(tk.Tk):
         self.nanoj_start.pack(side="left", padx=(0, 8))
         self.nanoj_stop = ttk.Button(nanoj, text="Stop NanoJ", command=lambda: self.control_nanoj(False))
         self.nanoj_stop.pack(side="left")
-        ttk.Label(connection, text="Stopping NanoJ may not stop the motor. Starting it resets its variables.", style="Muted.TLabel", wraplength=710).grid(row=5, column=0, columnspan=3, sticky="w")
-        ttk.Label(connection, textvariable=self.feedback_status, style="Muted.TLabel", wraplength=710).grid(row=6, column=0, columnspan=3, sticky="w", pady=(3, 0))
-        ttk.Label(frame, textvariable=self.status, style="Muted.TLabel", wraplength=740).grid(row=2, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(connection, text="Stopping NanoJ may not stop the motor. Starting it resets its variables.", style="Muted.TLabel", wraplength=px(710)).grid(row=5, column=0, columnspan=3, sticky="w")
+        ttk.Label(connection, textvariable=self.feedback_status, style="Muted.TLabel", wraplength=px(710)).grid(row=6, column=0, columnspan=3, sticky="w", pady=(3, 0))
+        ttk.Label(frame, textvariable=self.status, style="Muted.TLabel", wraplength=px(740)).grid(row=2, column=0, sticky="w", pady=(4, 0))
         self.ports.bind("<<ComboboxSelected>>", lambda e: self.update_controls())
         self.device_box.bind("<<ComboboxSelected>>", lambda e: self.update_controls())
         self.protocol("WM_DELETE_WINDOW", self.exit_app)
         self.update_controls()
-        self.after(100, self.poll)
+        self.poll_timer = self.after(100, self.poll)
 
-    def make_speed_slider(self, parent, column, title, value, slider_value):
-        panel = ttk.Frame(parent, padding=(5, 2, 12, 2))
+    def show_speed_rpm(self, raw, displayed):
+        try:
+            displayed.set(f"{int(raw.get()) / 10:.1f}")
+        except ValueError:
+            displayed.set("—")
+
+    def on_speed1_changed(self, *_):
+        self.show_speed_rpm(self.speed1, self.speed1_rpm)
+        if self.symmetric.get():
+            self.speed2.set(self.speed1.get())
+
+    def toggle_symmetric(self):
+        left = self.speed1_box.master
+        right = self.speed2_box.master
+        if self.symmetric.get():
+            self.speed2.set(self.speed1.get())
+            right.grid_remove()
+            left.grid_configure(columnspan=2)
+        else:
+            left.grid_configure(columnspan=1)
+            right.grid()
+            try:
+                value = int(self.speed2.get())
+                if 1 <= value <= 100:
+                    self.speed2_box.set(value)
+            except ValueError:
+                pass
+
+    def make_speed_slider(self, parent, column, title, value, display, slider_value):
+        panel = ttk.Frame(parent, padding=tuple(round(n * self.ui_scale) for n in (5, 2, 12, 2)))
         panel.grid(row=0, column=column, sticky="ew")
         panel.columnconfigure(0, weight=1)
         ttk.Label(panel, text=title, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(panel, textvariable=value, style="Speed.TLabel").grid(row=0, column=1, sticky="e")
+        ttk.Label(panel, textvariable=display, style="Speed.TLabel").grid(row=0, column=1, sticky="e")
         slider = tk.Scale(panel, from_=1, to=100, orient="horizontal", resolution=1,
-                          variable=slider_value, showvalue=False, sliderlength=44,
-                          width=32, borderwidth=0, highlightthickness=0,
+                          variable=slider_value, showvalue=False, sliderlength=round(44 * self.ui_scale),
+                          width=round(32 * self.ui_scale), borderwidth=0, highlightthickness=0,
                           bg="#111b29", troughcolor="#294256", fg="#e8f0f8",
                           activebackground="#54d1c6", command=lambda number: value.set(str(round(float(number)))))
         slider.grid(row=1, column=0, columnspan=2, sticky="ew")
-        ttk.Label(panel, text="1", style="Muted.TLabel").grid(row=2, column=0, sticky="w")
-        ttk.Label(panel, text="100", style="Muted.TLabel").grid(row=2, column=1, sticky="e")
+        ttk.Label(panel, text="0.1", style="Muted.TLabel").grid(row=2, column=0, sticky="w")
+        ttk.Label(panel, text="10.0", style="Muted.TLabel").grid(row=2, column=1, sticky="e")
         return slider
 
 
@@ -337,7 +380,7 @@ class App(tk.Tk):
         state(self.retry_button, idle and self.conn.connected and not self.feedback_active)
         state(self.nanoj_start, idle and self.conn.connected)
         state(self.nanoj_stop, idle and self.conn.connected)
-        for widget in (self.apply_speeds_button, self.cycle_start_button, self.cycle_stop_button):
+        for widget in (self.apply_speeds_button, self.cycle_button, self.symmetric_button):
             state(widget, idle and self.conn.connected)
         for widget in (self.speed1_box, self.speed2_box):
             state(widget, self.conn.connected and not self.closing)
@@ -345,24 +388,37 @@ class App(tk.Tk):
             widget.configure(state="readonly" if idle and not opened else "disabled")
         self.device_box.configure(state="readonly" if idle and opened and not connected else "disabled")
 
-    def run(self, label, work, done, quiet=False):
+    def run(self, label, work, done, quiet=False, on_error=None):
+        if self.busy:
+            if self.active_quiet and not quiet and self.pending_action is None and not self.closing:
+                # A controller command must wait for the current read; NanoLib
+                # operations must not run concurrently on the same connection.
+                self.pending_action = (label, work, done, on_error)
+                self.status.set("Waiting for the current reading…")
+                self.update_controls()
+            return
         self.busy = True
+        self.active_quiet = quiet
         if not quiet:
             self.status.set(label)
-        self.update_controls()
+            self.update_controls()
         def worker():
-            try: self.results.put((done, work(), None, quiet))
-            except Exception as exc: self.results.put((done, None, str(exc), quiet))
+            try: self.results.put((done, work(), None, quiet, on_error))
+            except Exception as exc: self.results.put((done, None, str(exc), quiet, on_error))
         threading.Thread(target=worker, daemon=True).start()
 
     def poll(self):
+        self.poll_timer = None
         try:
-            done, result, error, quiet = self.results.get_nowait()
+            done, result, error, quiet, on_error = self.results.get_nowait()
         except queue.Empty:
             pass
         else:
             self.busy = False
+            self.active_quiet = False
             if error:
+                if on_error is not None:
+                    on_error()
                 if quiet:
                     self.feedback_active = False
                     self.clear_feedback()
@@ -377,12 +433,29 @@ class App(tk.Tk):
                 done(result)
             if not self.winfo_exists():
                 return
-            self.update_controls()
             if self.closing:
+                if self.pending_action is not None:
+                    label, work, callback, failure = self.pending_action
+                    self.pending_action = None
+                    self.run(label, work, callback, on_error=failure)
+                    self.poll_timer = self.after(50, self.poll)
+                    return
                 self.closing = False
                 self.exit_app()
                 return
-        self.after(50, self.poll)
+            if self.pending_action is not None:
+                label, work, callback, failure = self.pending_action
+                self.pending_action = None
+                self.run(label, work, callback, on_error=failure)
+            elif not quiet or error:
+                self.update_controls()
+        self.poll_timer = self.after(50, self.poll)
+
+    def destroy(self):
+        if self.poll_timer is not None:
+            self.after_cancel(self.poll_timer)
+            self.poll_timer = None
+        super().destroy()
 
     def find_ports(self):
         self.ports['values'] = ()
@@ -426,26 +499,31 @@ class App(tk.Tk):
                 speed1 = speed1 if speed1 > 0 else 80
                 speed2 = speed2 if speed2 > 0 else 5
                 self.speed1.set(str(speed1))
-                self.speed2.set(str(speed2))
+                self.speed2.set(str(speed1 if self.symmetric.get() else speed2))
+                if self.symmetric.get():
+                    speed2 = speed1
                 for slider, speed in zip((self.speed1_box, self.speed2_box), (speed1, speed2)):
                     if 1 <= speed <= 100:
                         slider.set(speed)
                 if not (1 <= speed1 <= 100 and 1 <= speed2 <= 100):
-                    self.cycle_status.set("A controller speed is outside 1–100. Adjust the sliders before starting.")
+                    self.cycle_status.set("A controller speed is outside 0.1–10.0 rpm. Adjust the sliders before starting.")
                 else:
                     self.cycle_status.set("Speeds loaded. Adjust the sliders, then apply or start.")
             self.pages.select(0)
+            self.set_cycle_request(None)
+            self.cycle_status.set("Cycle state unknown. Stop the cycle before starting it from this screen.")
             self.start_feedback()
         self.run("Connecting…", work, done)
 
     def speed_values(self):
         try:
-            values = (int(self.speed1.get()), int(self.speed2.get()))
+            speed1 = int(self.speed1.get())
+            values = (speed1, speed1 if self.symmetric.get() else int(self.speed2.get()))
             if not all(1 <= value <= 100 for value in values):
                 raise ValueError
             return values
         except ValueError:
-            messagebox.showerror("Invalid speed", "Enter whole numbers from 1 to 100 for both speeds.", parent=self)
+            messagebox.showerror("Invalid speed", "Set both sliders between 0.1 and 10.0 rpm.", parent=self)
             return None
 
     def apply_speeds(self):
@@ -471,15 +549,34 @@ class App(tk.Tk):
         def done(zero_count):
             self.angle_zero = zero_count
             self.angle.set("0.00")
+            self.set_cycle_request("started")
             self.cycle_status.set("Start command sent. The program provides no cycle acknowledgment; check motion.")
             self.status.set("Cycle start command sent.")
-        self.run("Sending cycle start…", work, done)
+        self.run("Sending cycle start…", work, done, on_error=self.cycle_request_failed)
 
     def stop_cycle(self):
         def done(_):
+            self.set_cycle_request("stopped")
             self.cycle_status.set("Stop command sent. The program provides no cycle acknowledgment; check that motion stops.")
             self.status.set("Cycle stop command sent.")
-        self.run("Sending cycle stop…", lambda: self.conn.command_cycle(False), done)
+        self.run("Sending cycle stop…", lambda: self.conn.command_cycle(False), done, on_error=self.cycle_request_failed)
+
+    def set_cycle_request(self, state):
+        self.cycle_request = state
+        if state == "stopped":
+            self.cycle_button.configure(text="▶  START CYCLE", style="Start.TButton")
+        else:
+            self.cycle_button.configure(text="■  STOP CYCLE", style="CycleActive.TButton")
+
+    def cycle_request_failed(self):
+        self.set_cycle_request(None)
+        self.cycle_status.set("Cycle command failed or delivery is unknown. Check motion before retrying.")
+
+    def toggle_cycle(self):
+        if self.cycle_request == "stopped":
+            self.start_cycle()
+        else:
+            self.stop_cycle()
 
     def clear_feedback(self):
         self.encoder.set("—")
@@ -527,29 +624,39 @@ class App(tk.Tk):
             if self.feedback_active and not self.closing:
                 values, state = result
                 encoder, velocity = values
-                self.encoder.set(str(encoder))
+                self.set_if_changed(self.encoder, str(encoder))
                 if self.angle_zero is not None:
                     angle = ((encoder - self.angle_zero) % ENCODER_COUNTS_PER_MOTOR_REVOLUTION) * 360 / ENCODER_COUNTS_PER_MOTOR_REVOLUTION
-                    self.angle.set(f"{angle:.2f}")
+                    self.set_if_changed(self.angle, f"{angle:.2f}")
                 self.velocity_samples.append(velocity)
-                self.velocity.set(f"{sum(self.velocity_samples) / len(self.velocity_samples) / 10:.1f}")
+                self.set_if_changed(self.velocity, f"{sum(self.velocity_samples) / len(self.velocity_samples) / 10:.1f}")
                 self.show_nanoj_status(state)
-                self.feedback_status.set(f"Updated {datetime.now():%H:%M:%S}; velocity average: last {len(self.velocity_samples)} of 10 samples (~0.5 s apart).")
+                self.set_if_changed(self.feedback_status, "Live · velocity averaged over up to 10 samples.")
                 self.schedule_feedback()
         self.run("", work, done, quiet=True)
 
+    @staticmethod
+    def set_if_changed(variable, value):
+        if variable.get() != value:
+            variable.set(value)
+
     def show_nanoj_status(self, state):
         status, error = state
+        if (status is None or not (status & 1) or status & 4 or error) and self.cycle_request is not None:
+            self.set_cycle_request(None)
+            self.cycle_status.set("Cycle state unknown. Check NanoJ and the platform before starting.")
         if status is None:
-            self.nanoj_state.set(f"NanoJ status unavailable: {error}")
+            self.set_if_changed(self.nanoj_state, f"NanoJ status unavailable: {error}")
         elif status & 4 or error:
-            self.nanoj_state.set(f"NanoJ error: status {status}, code {error}")
+            self.set_if_changed(self.nanoj_state, f"NanoJ error: status {status}, code {error}")
         else:
-            self.nanoj_state.set("NanoJ: " + ("running" if status & 1 else "stopped"))
+            self.set_if_changed(self.nanoj_state, "NanoJ: " + ("running" if status & 1 else "stopped"))
 
     def control_nanoj(self, running):
         self.nanoj_state.set("Sending NanoJ command…")
         def done(state):
+            self.set_cycle_request(None)
+            self.cycle_status.set("Cycle state unknown. Stop the cycle before starting it from this screen.")
             self.show_nanoj_status(state)
             status, error = state
             if error or bool(status & 1) != running:
@@ -560,6 +667,7 @@ class App(tk.Tk):
 
     def close_connection(self):
         self.stop_feedback()
+        self.set_cycle_request(None)
         self.speed1.set("")
         self.speed2.set("")
         self.cycle_status.set("Disconnected.")
@@ -572,6 +680,9 @@ class App(tk.Tk):
     def exit_app(self):
         self.stop_feedback()
         if self.busy:
+            # Keep an already-requested cycle stop; cancel other queued actions.
+            if self.pending_action is not None and self.pending_action[0] != "Sending cycle stop…":
+                self.pending_action = None
             self.closing = True
             self.status.set("Waiting for the current operation before closing…")
         elif self.conn.bus is not None or self.conn.handle is not None:
@@ -581,7 +692,8 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
-    app = App()
-    if "--fullscreen" in sys.argv[1:]:
+    fullscreen = "--fullscreen" in sys.argv[1:] or (sys.platform.startswith("linux") and "--windowed" not in sys.argv[1:])
+    app = App(fullscreen=fullscreen)
+    if fullscreen:
         app.attributes("-fullscreen", True)
     app.mainloop()
