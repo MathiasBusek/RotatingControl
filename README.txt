@@ -38,8 +38,16 @@ Position cycle controls (requires the modified NanoJ program):
 - Drag the Speed 1 and Speed 2 sliders from 0.1 to 10.0 rpm, in 0.1 rpm steps.
   The GUI multiplies each displayed value by 10 before writing the integer
   setting to the controller. Each is used at the next corresponding segment.
+- The Switch Angle slider controls the end of Speed 1 and the beginning of
+  Speed 2. Its range is 3.6 to 356.4 motor degrees in 3.6 degree steps; the
+  original 75/25 movement corresponds to 270 degrees. Apply Settings sends
+  the selection, and NanoJ latches it at the beginning of the next position
+  cycle. Speed 2 covers the remainder of that revolution. It has no effect
+  during symmetric continuous rotation. The GUI verifies that the drive uses
+  hundredths of a revolution and a 1:1 configured gear ratio before writing.
+  External mechanical gearing, if present, affects the platform angle.
 - Symmetric hides Speed 2 and uses Speed 1 for both settings. Changes are
-  sent with Apply speeds or Start cycle.
+  sent with Apply Settings or Start cycle.
 - The cycle button alternates between sending start and stop requests. NanoJ
   does not acknowledge the cycle state. On connection the state is unknown,
   so the button first offers Immediate stop; check the platform before starting.

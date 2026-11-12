@@ -17,6 +17,7 @@ from nanotec_nanolib import Nanolib as nl
 
 ENCODER_COUNTS_PER_MOTOR_REVOLUTION = 16384
 LOG_INTERVAL_SECONDS = 300
+POSITION_UNITS_PER_REVOLUTION = 100
 
 
 class DailyCycleLogger:
@@ -57,6 +58,7 @@ class Connection:
         self.bus = None
         self.handle = None
         self.connected = False
+        self.switch_position = 75
 
     def find_ports(self):
         buses = checked(self.api.listAvailableBusHardware(), "Find interfaces")
@@ -150,19 +152,62 @@ class Connection:
     def read_cycle_speeds(self):
         if not self.connected:
             raise RuntimeError("Controller is not connected.")
-        return tuple(checked(self.api.readNumber(self.handle, nl.OdIndex(0x2400, sub)),
-                             f"Read Position {sub} speed") for sub in (1, 2))
+        speeds = tuple(checked(self.api.readNumber(self.handle, nl.OdIndex(0x2400, sub)),
+                               f"Read Position {sub} speed") for sub in (1, 2))
+        position = checked(self.api.readNumber(self.handle, nl.OdIndex(0x2400, 8)), "Read switching position")
+        self.switch_position = position if 1 <= position <= 99 else 75
+        return speeds
 
-    def set_cycle_speeds(self, speed1, speed2):
+    def set_switch_position(self, position, validate_only=False):
+        if not self.connected or not isinstance(position, int) or not 1 <= position <= 99:
+            raise ValueError("Switching position must be between 1 and 99 position units.")
+        mappings = [checked(self.api.readNumber(self.handle, nl.OdIndex(0x2310, sub)),
+                            "Read NanoJ input mapping") for sub in range(1, 17)]
+        if 0x24000820 not in mappings:
+            raise RuntimeError("Upload the updated NanoJ program before setting the switching angle.")
+        unit = checked(self.api.readNumber(self.handle, nl.OdIndex(0x60A8, 0)), "Read position unit") & 0xFFFFFFFF
+        gear = tuple(checked(self.api.readNumber(self.handle, nl.OdIndex(0x6091, sub)),
+                             "Read gear ratio") for sub in (1, 2))
+        if unit != 0xFEB40000 or gear != (1, 1):
+            raise RuntimeError("The controller position unit or gear ratio differs from the saved project. Angle settings were not sent; check controller scaling.")
+        if validate_only:
+            return
+        checked(self.api.writeNumber(self.handle, position, nl.OdIndex(0x2400, 8), 32), "Write switching position")
+        actual = checked(self.api.readNumber(self.handle, nl.OdIndex(0x2400, 8)), "Read switching position")
+        if actual != position:
+            raise RuntimeError("Switching position readback did not match; check the controller setting.")
+        self.switch_position = actual
+
+    def set_cycle_speeds(self, speed1, speed2, validate_only=False):
         if not self.connected:
             raise RuntimeError("Controller is not connected.")
         if any(not isinstance(v, int) or isinstance(v, bool) or not 1 <= v <= 100 for v in (speed1, speed2)):
             raise ValueError("Both speeds must be whole numbers from 1 to 100.")
+        state, error = self.nanoj_status()
+        if not state & 1 or state & 4 or error:
+            raise RuntimeError("NanoJ must be running without an error before applying speeds.")
+        # The mapping distinguishes the new NanoJ program from the older program,
+        # which exposes the same general-purpose input registers but ignores mode.
+        mappings = [checked(self.api.readNumber(self.handle, nl.OdIndex(0x2310, sub)),
+                            "Read NanoJ input mapping") for sub in range(1, 17)]
+        if 0x24000720 not in mappings:
+            raise RuntimeError("The controller needs the updated NanoJ program for mode selection. Upload it with Plug & Drive Studio first.")
+        requested_mode = 1 if speed1 == speed2 else 0
+        active_mode = checked(self.api.readNumber(self.handle, nl.OdIndex(0x2500, 1)), "Read active cycle mode")
+        displayed_mode = checked(self.api.readNumber(self.handle, nl.OdIndex(0x6061, 0)), "Read drive operation mode")
+        if requested_mode != active_mode or displayed_mode != (3 if requested_mode else 1):
+            status = checked(self.api.readNumber(self.handle, nl.OdIndex(0x6041, 0)), "Read drive status")
+            velocity = checked(self.api.readNumber(self.handle, nl.OdIndex(0x606C, 0)), "Read actual velocity")
+            if status & 0x6F != 0x23 or velocity != 0:
+                raise RuntimeError("Stop the motor and wait for it to stand still before changing between continuous and position modes.")
+        if validate_only:
+            return
         try:
-            for sub, value in ((1, speed1), (2, speed2)):
+            for sub, value in ((1, speed1), (2, speed2), (7, requested_mode)):
                 checked(self.api.writeNumber(self.handle, value, nl.OdIndex(0x2400, sub), 32), f"Write Position {sub} speed")
             actual = self.read_cycle_speeds()
-            if actual != (speed1, speed2):
+            actual_mode = checked(self.api.readNumber(self.handle, nl.OdIndex(0x2400, 7)), "Read requested mode")
+            if actual != (speed1, speed2) or actual_mode != requested_mode:
                 raise RuntimeError(f"Readback returned {actual}.")
         except Exception as exc:
             raise RuntimeError(f"Could not set both speeds: {exc} One or both settings may have changed; check before continuing.") from exc
@@ -259,6 +304,9 @@ class App(tk.Tk):
         self.speed1 = tk.StringVar(value="")
         self.speed2 = tk.StringVar(value="")
         self.symmetric = tk.BooleanVar(value=False)
+        self.switch_position = tk.IntVar(value=75)
+        self.switch_degrees = tk.StringVar(value="270.0°")
+        self.switch_position.trace_add("write", lambda *_: self.switch_degrees.set(f"{self.switch_position.get() * 3.6:.1f}°"))
         # NanoJ does not expose cycle state; None means it has not been confirmed.
         self.cycle_request = None
         self.boundary_stop_pending = False
@@ -341,9 +389,22 @@ class App(tk.Tk):
         speeds.grid(row=1, column=0, sticky="ew")
         speeds.columnconfigure(0, weight=1, uniform="speed")
         speeds.columnconfigure(1, weight=1, uniform="speed")
+        speeds.columnconfigure(2, weight=1, uniform="speed")
         self.slider_values = [tk.IntVar(value=80), tk.IntVar(value=5)]
         self.speed1_box = self.make_speed_slider(speeds, 0, "SPEED 1 · RPM", self.speed1, self.speed1_rpm, self.slider_values[0])
         self.speed2_box = self.make_speed_slider(speeds, 1, "SPEED 2 · RPM", self.speed2, self.speed2_rpm, self.slider_values[1])
+        angle_panel = ttk.Frame(speeds, padding=(5, 2, 12, 2))
+        angle_panel.grid(row=0, column=2, sticky="ew")
+        angle_panel.columnconfigure(0, weight=1)
+        ttk.Label(angle_panel, text="SWITCH ANGLE", style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(angle_panel, textvariable=self.switch_degrees, style="Speed.TLabel").grid(row=0, column=1, sticky="e")
+        self.switch_box = tk.Scale(angle_panel, from_=1, to=99, orient="horizontal", resolution=1,
+                                   variable=self.switch_position, showvalue=False, sliderlength=round(44 * self.ui_scale),
+                                   width=round(32 * self.ui_scale), borderwidth=0, highlightthickness=0,
+                                   bg="#111b29", troughcolor="#294256", fg="#e8f0f8", activebackground="#54d1c6")
+        self.switch_box.grid(row=1, column=0, columnspan=2, sticky="ew")
+        ttk.Label(angle_panel, text="3.6°", style="Muted.TLabel").grid(row=2, column=0, sticky="w")
+        ttk.Label(angle_panel, text="356.4°", style="Muted.TLabel").grid(row=2, column=1, sticky="e")
 
         actions = ttk.Frame(control)
         actions.grid(row=2, column=0, sticky="ew", pady=(8, 2))
@@ -354,7 +415,7 @@ class App(tk.Tk):
         self.boundary_stop_button.grid(row=0, column=1, sticky="ew", padx=3)
         self.symmetric_button = ttk.Checkbutton(actions, text="SYMMETRIC", style="Symmetric.Toolbutton", variable=self.symmetric, command=self.toggle_symmetric)
         self.symmetric_button.grid(row=0, column=2, sticky="ew", padx=3)
-        self.apply_speeds_button = ttk.Button(actions, text="APPLY SPEEDS", command=self.apply_speeds)
+        self.apply_speeds_button = ttk.Button(actions, text="APPLY SETTINGS", command=self.apply_speeds)
         self.apply_speeds_button.grid(row=0, column=3, sticky="ew", padx=(6, 0))
         status_bar = ttk.Frame(control)
         status_bar.grid(row=3, column=0, sticky="ew", pady=(px(8), 0))
@@ -469,7 +530,7 @@ class App(tk.Tk):
         for widget in (self.apply_speeds_button, self.cycle_button, self.symmetric_button):
             state(widget, idle and self.conn.connected)
         state(self.boundary_stop_button, idle and self.conn.connected and self.feedback_active and self.angle_zero is not None and not self.boundary_stop_pending)
-        for widget in (self.speed1_box, self.speed2_box):
+        for widget in (self.speed1_box, self.speed2_box, self.switch_box):
             state(widget, self.conn.connected and not self.closing)
         for widget in (self.ports, self.baud_box, self.parity_box):
             widget.configure(state="readonly" if idle and not opened else "disabled")
@@ -621,6 +682,7 @@ class App(tk.Tk):
         self.run("Connecting…", work, done)
 
     def connected_ui(self, name, speeds, error):
+            self.switch_position.set(getattr(self.conn, 'switch_position', 75))
             self.boundary_stop_pending = False
             self.boundary_stop_anchor = None
             self.boundary_stop_target = None
@@ -679,20 +741,35 @@ class App(tk.Tk):
         values = self.speed_values()
         if values is None:
             return
+        position = self.switch_position.get()
         def done(_):
             self.applied_speeds = values
-            self.status.set("Speeds confirmed; they apply at the next segment.")
-        self.run("Setting speeds…", lambda: self.conn.set_cycle_speeds(*values), done)
+            mode = "continuous rotation" if values[0] == values[1] else "two-position sequence"
+            timing = "continuous speed updates while running" if values[0] == values[1] else "speeds apply at the next segment"
+            self.status.set(f"Selected {mode}; switch angle applies at the next cycle, {timing}.")
+        def work():
+            self.conn.set_switch_position(position, validate_only=True)
+            self.conn.set_cycle_speeds(*values, validate_only=True)
+            self.conn.set_switch_position(position)
+            try:
+                self.conn.set_cycle_speeds(*values)
+            except Exception as exc:
+                raise RuntimeError(f"Switching angle was updated, but speeds or mode may not have been: {exc}") from exc
+        self.run("Applying settings…", work, done)
 
     def start_cycle(self):
         values = self.speed_values()
         if values is None:
             return
+        position = self.switch_position.get()
         self.angle_zero = None
         self.last_encoder = None
         self.boundary_stop_pending = False
         self.angle.set("—")
         def work():
+            self.conn.set_switch_position(position, validate_only=True)
+            self.conn.set_cycle_speeds(*values, validate_only=True)
+            self.conn.set_switch_position(position)
             self.conn.set_cycle_speeds(*values)
             zero_count = self.conn.read_encoder()
             self.conn.command_cycle(True)
@@ -710,7 +787,8 @@ class App(tk.Tk):
             self.runtime_display.set("Runtime 00:00:00")
             self.angle.set("0.00")
             self.set_cycle_request("started")
-            self.status.set("Start requested; no confirmation from NanoJ. Check motion.")
+            mode = "continuous rotation" if values[0] == values[1] else "two-position sequence"
+            self.status.set(f"Start requested: {mode}; no confirmation from NanoJ. Check motion.")
             self.record_cycle_event("start_requested", zero_count, wall_time)
         self.run("Sending cycle start…", work, done, on_error=self.cycle_request_failed)
 
