@@ -2,17 +2,39 @@
 
 Based on Nanotec's NanoLib example (CC BY 4.0), Nanotec GmbH & Co. KG.
 """
+import csv
 import queue
 import sys
 import threading
 import time
 from collections import deque
+from datetime import datetime
+from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox
 
 from nanotec_nanolib import Nanolib as nl
 
 ENCODER_COUNTS_PER_MOTOR_REVOLUTION = 16384
+LOG_INTERVAL_SECONDS = 300
+
+
+class DailyCycleLogger:
+    """Append local-time entries to separate daily CSV files."""
+    def __init__(self, directory):
+        self.directory = Path(directory)
+
+    def write(self, timestamp, event, speeds, encoder):
+        self.directory.mkdir(parents=True, exist_ok=True)
+        path = self.directory / f"rotation_{timestamp:%Y-%m-%d}.csv"
+        needs_header = not path.exists() or path.stat().st_size == 0
+        with path.open("a", encoding="utf-8", newline="") as log:
+            writer = csv.writer(log)
+            if needs_header:
+                writer.writerow(("timestamp", "event", "requested_speed1_rpm", "requested_speed2_rpm", "encoder_counts"))
+            writer.writerow((timestamp.isoformat(timespec="seconds"), event,
+                             f"{speeds[0] / 10:.1f}", f"{speeds[1] / 10:.1f}", encoder))
+        return path
 
 
 def checked(result, operation):
@@ -211,7 +233,14 @@ class App(tk.Tk):
         self.closing = False
         self.feedback_timer = None
         self.poll_timer = None
+        self.runtime_timer = None
         self.feedback_active = False
+        self.logger = DailyCycleLogger(Path(__file__).resolve().parent / "logs")
+        self.runtime_started = None
+        self.runtime_stopped = None
+        self.cycle_tracking = False
+        self.next_log_due = None
+        self.applied_speeds = None
         self.velocity_samples = deque(maxlen=10)
         self.angle_zero = None
         self.last_encoder = None
@@ -225,6 +254,7 @@ class App(tk.Tk):
         self.angle = tk.StringVar(value="—")
         self.velocity = tk.StringVar(value="—")
         self.nanoj_state = tk.StringVar(value="Unknown — connect to read status.")
+        self.runtime_display = tk.StringVar(value="Runtime 00:00:00")
         self.feedback_status = tk.StringVar(value="Connect to start live readings.")
         self.speed1 = tk.StringVar(value="")
         self.speed2 = tk.StringVar(value="")
@@ -284,7 +314,10 @@ class App(tk.Tk):
         header.columnconfigure(0, weight=1)
         ttk.Label(header, text="ROTATION CONTROL", style="Heading.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(header, textvariable=self.nanoj_state, style="Muted.TLabel").grid(row=0, column=1, sticky="e")
-        ttk.Button(header, text="Exit", command=self.exit_app).grid(row=0, column=2, padx=(12, 0))
+        self.runtime_label = ttk.Label(header, textvariable=self.runtime_display, style="Muted.TLabel")
+        self.runtime_label.grid(row=0, column=2, sticky="e", padx=(px(12), 0))
+        self.exit_button = ttk.Button(header, text="Exit", command=self.exit_app)
+        self.exit_button.grid(row=0, column=3, padx=(12, 0))
 
         self.pages = ttk.Notebook(frame)
         self.pages.grid(row=1, column=0, sticky="nsew")
@@ -371,6 +404,7 @@ class App(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self.exit_app)
         self.update_controls()
         self.poll_timer = self.after(100, self.poll)
+        self.runtime_timer = self.after(1000, self.update_runtime_clock)
         if autoconnect:
             self.after(250, self.auto_connect)
 
@@ -474,6 +508,7 @@ class App(tk.Tk):
                     on_error()
                 if quiet:
                     self.feedback_active = False
+                    self.stop_runtime_tracking()
                     self.clear_feedback()
                     self.boundary_stop_pending = False
                     self.boundary_stop_anchor = None
@@ -520,7 +555,35 @@ class App(tk.Tk):
         if self.poll_timer is not None:
             self.after_cancel(self.poll_timer)
             self.poll_timer = None
+        if self.runtime_timer is not None:
+            self.after_cancel(self.runtime_timer)
+            self.runtime_timer = None
         super().destroy()
+
+    def update_runtime_clock(self):
+        if self.runtime_started is not None:
+            end = time.monotonic() if self.cycle_tracking else self.runtime_stopped
+            if end is not None:
+                elapsed = max(0, int(end - self.runtime_started))
+                hours, remainder = divmod(elapsed, 3600)
+                minutes, seconds = divmod(remainder, 60)
+                self.set_if_changed(self.runtime_display, f"Runtime {hours:02}:{minutes:02}:{seconds:02}")
+        self.runtime_timer = self.after(1000, self.update_runtime_clock)
+
+    def stop_runtime_tracking(self):
+        if self.cycle_tracking:
+            self.runtime_stopped = time.monotonic()
+            self.cycle_tracking = False
+            self.next_log_due = None
+
+    def record_cycle_event(self, event, encoder, timestamp=None):
+        if self.applied_speeds is None:
+            self.status.set("Logging failed: speed settings are unavailable.")
+            return
+        try:
+            self.logger.write(timestamp or datetime.now().astimezone(), event, self.applied_speeds, encoder)
+        except (OSError, ValueError) as exc:
+            self.status.set(f"Logging failed: {exc}")
 
     def find_ports(self):
         self.ports['values'] = ()
@@ -617,6 +680,7 @@ class App(tk.Tk):
         if values is None:
             return
         def done(_):
+            self.applied_speeds = values
             self.status.set("Speeds confirmed; they apply at the next segment.")
         self.run("Setting speeds…", lambda: self.conn.set_cycle_speeds(*values), done)
 
@@ -632,14 +696,22 @@ class App(tk.Tk):
             self.conn.set_cycle_speeds(*values)
             zero_count = self.conn.read_encoder()
             self.conn.command_cycle(True)
-            return zero_count
-        def done(zero_count):
+            return zero_count, time.monotonic(), datetime.now().astimezone()
+        def done(result):
+            zero_count, requested_at, wall_time = result
             self.angle_zero = zero_count
             self.last_encoder = zero_count
             self.unwrapped_counts = 0
+            self.applied_speeds = values
+            self.runtime_started = requested_at
+            self.runtime_stopped = None
+            self.cycle_tracking = True
+            self.next_log_due = requested_at + LOG_INTERVAL_SECONDS
+            self.runtime_display.set("Runtime 00:00:00")
             self.angle.set("0.00")
             self.set_cycle_request("started")
             self.status.set("Start requested; no confirmation from NanoJ. Check motion.")
+            self.record_cycle_event("start_requested", zero_count, wall_time)
         self.run("Sending cycle start…", work, done, on_error=self.cycle_request_failed)
 
     def stop_cycle(self):
@@ -649,6 +721,7 @@ class App(tk.Tk):
         self.boundary_stop_direction = None
         self.boundary_stop_armed_at = None
         def done(_):
+            self.stop_runtime_tracking()
             self.set_cycle_request("stopped")
             self.status.set("Stop requested; no confirmation from NanoJ. Check motion.")
         self.run("Sending cycle stop…", lambda: self.conn.command_cycle(False), done, on_error=self.cycle_request_failed)
@@ -678,6 +751,7 @@ class App(tk.Tk):
         self.update_controls()
 
     def cycle_request_failed(self):
+        self.stop_runtime_tracking()
         self.set_cycle_request(None)
         self.cycle_status.set("Cycle command failed or delivery is unknown. Check motion before retrying.")
 
@@ -702,6 +776,7 @@ class App(tk.Tk):
         self.velocity_samples.clear()
 
     def stop_feedback(self):
+        self.stop_runtime_tracking()
         self.feedback_active = False
         if self.feedback_timer is not None:
             self.after_cancel(self.feedback_timer)
@@ -751,6 +826,9 @@ class App(tk.Tk):
                 self.velocity_samples.append(velocity)
                 self.set_if_changed(self.velocity, f"{sum(self.velocity_samples) / len(self.velocity_samples) / 10:.1f}")
                 self.show_nanoj_status(state)
+                if self.cycle_tracking and self.next_log_due is not None and sampled_at >= self.next_log_due:
+                    self.next_log_due = sampled_at + LOG_INTERVAL_SECONDS
+                    self.record_cycle_event("periodic_unconfirmed", encoder)
                 if crossed_zero and self.boundary_stop_pending:
                     self.stop_cycle()
                 self.set_if_changed(self.feedback_status, "Live · velocity averaged over up to 10 samples.")
@@ -795,6 +873,7 @@ class App(tk.Tk):
             self.set_cycle_request(None)
             self.cycle_status.set("Cycle state unknown. Check NanoJ and the platform before starting.")
         if status is None or not (status & 1) or status & 4 or error:
+            self.stop_runtime_tracking()
             was_pending = self.boundary_stop_pending
             self.boundary_stop_pending = False
             if was_pending:
