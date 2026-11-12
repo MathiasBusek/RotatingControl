@@ -20,6 +20,10 @@ LOG_INTERVAL_SECONDS = 300
 POSITION_UNITS_PER_REVOLUTION = 100
 
 
+class ModeChangeBlocked(RuntimeError):
+    """The requested drive mode requires the motor to be stopped first."""
+
+
 class DailyCycleLogger:
     """Append local-time entries to separate daily CSV files."""
     def __init__(self, directory):
@@ -202,7 +206,7 @@ class Connection:
             details = f"Drive status 0x{status & 0xFFFF:04X}; velocity {velocity / 10:.1f} rpm; active mode {displayed_mode}."
             switch_on_disabled = status & 0x4F == 0x40
             if not (switch_on_disabled or drive_state in (0x21, 0x23)) or velocity != 0:
-                raise RuntimeError("Stop the motor with IMMEDIATE STOP and wait for zero velocity before changing modes. " + details)
+                raise ModeChangeBlocked("Stop the motor: press IMMEDIATE STOP, wait for zero velocity, then press APPLY SETTINGS. " + details)
             if switch_on_disabled or drive_state == 0x21:
                 out_mappings = [checked(self.api.readNumber(self.handle, nl.OdIndex(0x2320, sub)),
                                         "Read NanoJ output mapping") for sub in range(1, 17)]
@@ -561,7 +565,7 @@ class App(tk.Tk):
             self.update_controls()
         def worker():
             try: self.results.put((done, work(), None, quiet, on_error))
-            except Exception as exc: self.results.put((done, None, str(exc), quiet, on_error))
+            except Exception as exc: self.results.put((done, None, exc, quiet, on_error))
         threading.Thread(target=worker, daemon=True).start()
 
     def poll(self):
@@ -590,10 +594,14 @@ class App(tk.Tk):
                     self.feedback_status.set(f"Read failed: {error}. Select Resume readings to retry.")
                     self.status.set("Feedback lost; cycle status unknown. Check motion and reconnect.")
                 else:
-                    self.status.set(error)
+                    self.status.set(str(error))
                     if self.nanoj_state.get() == "Sending NanoJ command…":
                         self.nanoj_state.set("NanoJ command failed; status not verified.")
-                    messagebox.showerror("NanoLib", error, parent=self)
+                    # A modal dialog prevents the operator from using the stop
+                    # control. Show connected-controller errors in the status
+                    # bar; keep the connection-failure dialog when disconnected.
+                    if not self.conn.connected:
+                        messagebox.showerror("NanoLib", str(error), parent=self)
             else:
                 done(result)
             if not self.winfo_exists():
