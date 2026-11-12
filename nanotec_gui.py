@@ -13,8 +13,6 @@ from tkinter import ttk, messagebox
 from nanotec_nanolib import Nanolib as nl
 
 ENCODER_COUNTS_PER_MOTOR_REVOLUTION = 16384
-CYCLE_STOP_PROTOCOL = 1370264
-CYCLE_STOP_MAPPING = 0x24000620
 
 
 def checked(result, operation):
@@ -161,39 +159,6 @@ class Connection:
         except Exception as exc:
             raise RuntimeError(f"Cycle command failed or its delivery is unknown: {exc}. Check the platform before retrying.") from exc
 
-    def supports_cycle_boundary_stop(self):
-        status, error = self.nanoj_status()
-        if not status & 1 or status & 4 or error:
-            return False
-        read = lambda index, sub: checked(self.api.readNumber(self.handle, nl.OdIndex(index, sub)), "Read NanoJ protocol")
-        if read(0x2500, 1) != CYCLE_STOP_PROTOCOL:
-            return False
-        count = min(read(0x2310, 0), 16)
-        return any(read(0x2310, i) == CYCLE_STOP_MAPPING for i in range(1, count + 1))
-
-    def read_boundary_stop_status(self):
-        read = lambda sub: checked(self.api.readNumber(self.handle, nl.OdIndex(0x2500, sub)), "Read cycle-stop status")
-        if read(1) != CYCLE_STOP_PROTOCOL:
-            raise RuntimeError("Cycle-stop protocol no longer available.")
-        return read(2), read(3)
-
-    def request_cycle_boundary_stop(self):
-        if not self.connected or not self.supports_cycle_boundary_stop():
-            raise RuntimeError("The updated NanoJ cycle-stop program is not running.")
-        index = nl.OdIndex(0x2400, 6)
-        old = checked(self.api.readNumber(self.handle, index), "Read cycle-stop counter")
-        token = old + 1 if old < 2147483647 else 0
-        try:
-            checked(self.api.writeNumber(self.handle, token, index, 32), "Write cycle-stop request")
-        except Exception as exc:
-            raise RuntimeError(f"Cycle-stop delivery is unknown: {exc}. Check the platform before retrying.") from exc
-        for _ in range(10):
-            time.sleep(0.1)
-            ack, state = self.read_boundary_stop_status()
-            if ack == token:
-                return token, state
-        raise RuntimeError("Cycle-stop request sent but not acknowledged. Check the platform before retrying.")
-
     def set_nanoj_running(self, running):
         if not self.connected:
             raise RuntimeError("Controller is not connected.")
@@ -249,6 +214,8 @@ class App(tk.Tk):
         self.feedback_active = False
         self.velocity_samples = deque(maxlen=10)
         self.angle_zero = None
+        self.last_encoder = None
+        self.unwrapped_counts = 0
         self.port = tk.StringVar()
         self.device = tk.StringVar()
         self.baud = tk.StringVar(value="19200")
@@ -264,9 +231,11 @@ class App(tk.Tk):
         self.symmetric = tk.BooleanVar(value=False)
         # NanoJ does not expose cycle state; None means it has not been confirmed.
         self.cycle_request = None
-        self.boundary_stop_supported = False
-        self.boundary_stop_token = None
         self.boundary_stop_pending = False
+        self.boundary_stop_anchor = None
+        self.boundary_stop_target = None
+        self.boundary_stop_direction = None
+        self.boundary_stop_armed_at = None
         self.speed1_rpm = tk.StringVar(value="—")
         self.speed2_rpm = tk.StringVar(value="—")
         self.speed1.trace_add("write", self.on_speed1_changed)
@@ -346,7 +315,7 @@ class App(tk.Tk):
         actions = ttk.Frame(control)
         actions.grid(row=2, column=0, sticky="ew", pady=(8, 2))
         for column in range(4): actions.columnconfigure(column, weight=1, uniform="action")
-        self.cycle_button = ttk.Button(actions, text="■ SOFTWARE STOP", style="CycleActive.TButton", command=self.toggle_cycle)
+        self.cycle_button = ttk.Button(actions, text="■ IMMEDIATE STOP", style="CycleActive.TButton", command=self.toggle_cycle)
         self.cycle_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
         self.boundary_stop_button = ttk.Button(actions, text="STOP CYCLE", command=self.stop_at_cycle_end)
         self.boundary_stop_button.grid(row=0, column=1, sticky="ew", padx=3)
@@ -465,7 +434,7 @@ class App(tk.Tk):
         state(self.nanoj_stop, idle and self.conn.connected)
         for widget in (self.apply_speeds_button, self.cycle_button, self.symmetric_button):
             state(widget, idle and self.conn.connected)
-        state(self.boundary_stop_button, idle and self.conn.connected and self.boundary_stop_supported and not self.boundary_stop_pending)
+        state(self.boundary_stop_button, idle and self.conn.connected and self.feedback_active and self.angle_zero is not None and not self.boundary_stop_pending)
         for widget in (self.speed1_box, self.speed2_box):
             state(widget, self.conn.connected and not self.closing)
         for widget in (self.ports, self.baud_box, self.parity_box):
@@ -506,9 +475,11 @@ class App(tk.Tk):
                 if quiet:
                     self.feedback_active = False
                     self.clear_feedback()
-                    self.boundary_stop_supported = False
                     self.boundary_stop_pending = False
-                    self.boundary_stop_token = None
+                    self.boundary_stop_anchor = None
+                    self.boundary_stop_target = None
+                    self.boundary_stop_direction = None
+                    self.boundary_stop_armed_at = None
                     self.set_cycle_request(None)
                     self.nanoj_state.set("NanoJ status unavailable.")
                     self.feedback_status.set(f"Read failed: {error}. Select Resume readings to retry.")
@@ -521,6 +492,11 @@ class App(tk.Tk):
             else:
                 done(result)
             if not self.winfo_exists():
+                return
+            # A feedback callback may have started the zero-crossing stop.
+            # Let it finish before dispatching a user action queued during the read.
+            if self.busy:
+                self.poll_timer = self.after(50, self.poll)
                 return
             if self.closing:
                 if self.pending_action is not None:
@@ -576,19 +552,17 @@ class App(tk.Tk):
                 speeds, speed_error = self.conn.read_cycle_speeds(), None
             except Exception as exc:
                 speeds, speed_error = None, str(exc)
-            try:
-                supports_stop = self.conn.supports_cycle_boundary_stop()
-            except Exception:
-                supports_stop = False
-            return name, speeds, speed_error, supports_stop
+            return name, speeds, speed_error
         def done(result):
             self.connected_ui(*result)
         self.run("Connecting…", work, done)
 
-    def connected_ui(self, name, speeds, error, supports_stop):
-            self.boundary_stop_supported = supports_stop
+    def connected_ui(self, name, speeds, error):
             self.boundary_stop_pending = False
-            self.boundary_stop_token = None
+            self.boundary_stop_anchor = None
+            self.boundary_stop_target = None
+            self.boundary_stop_direction = None
+            self.boundary_stop_armed_at = None
             if error:
                 self.speed1.set("")
                 self.speed2.set("")
@@ -610,8 +584,6 @@ class App(tk.Tk):
                     status_message = "Cycle state unknown; stop before starting."
             self.pages.select(0)
             self.set_cycle_request(None)
-            if not supports_stop:
-                status_message += " Stop cycle unavailable; update NanoJ."
             self.status.set(status_message)
             self.start_feedback()
 
@@ -619,19 +591,14 @@ class App(tk.Tk):
         if self.busy or self.conn.connected or self.closing:
             return
         def work():
-            result = self.conn.auto_connect()
-            try:
-                supports_stop = self.conn.supports_cycle_boundary_stop()
-            except Exception:
-                supports_stop = False
-            return result, supports_stop
+            return self.conn.auto_connect()
         def done(result):
-            (ports, port_index, devices, device_index, name, speeds, error), supports_stop = result
+            ports, port_index, devices, device_index, name, speeds, error = result
             self.ports['values'] = ports
             self.ports.current(port_index)
             self.device_box['values'] = devices
             self.device_box.current(device_index)
-            self.connected_ui(name, speeds, error, supports_stop)
+            self.connected_ui(name, speeds, error)
         self.run("Connecting to the controller…", work, done)
 
     def speed_values(self):
@@ -658,6 +625,8 @@ class App(tk.Tk):
         if values is None:
             return
         self.angle_zero = None
+        self.last_encoder = None
+        self.boundary_stop_pending = False
         self.angle.set("—")
         def work():
             self.conn.set_cycle_speeds(*values)
@@ -666,15 +635,20 @@ class App(tk.Tk):
             return zero_count
         def done(zero_count):
             self.angle_zero = zero_count
+            self.last_encoder = zero_count
+            self.unwrapped_counts = 0
             self.angle.set("0.00")
             self.set_cycle_request("started")
             self.status.set("Start requested; no confirmation from NanoJ. Check motion.")
         self.run("Sending cycle start…", work, done, on_error=self.cycle_request_failed)
 
     def stop_cycle(self):
+        self.boundary_stop_pending = False
+        self.boundary_stop_anchor = None
+        self.boundary_stop_target = None
+        self.boundary_stop_direction = None
+        self.boundary_stop_armed_at = None
         def done(_):
-            self.boundary_stop_pending = False
-            self.boundary_stop_token = None
             self.set_cycle_request("stopped")
             self.status.set("Stop requested; no confirmation from NanoJ. Check motion.")
         self.run("Sending cycle stop…", lambda: self.conn.command_cycle(False), done, on_error=self.cycle_request_failed)
@@ -684,24 +658,24 @@ class App(tk.Tk):
         if state == "stopped":
             self.cycle_button.configure(text="▶ START", style="Start.TButton")
         else:
-            self.cycle_button.configure(text="■ SOFTWARE STOP", style="CycleActive.TButton")
+            self.cycle_button.configure(text="■ IMMEDIATE STOP", style="CycleActive.TButton")
 
     def stop_at_cycle_end(self):
-        if not self.boundary_stop_supported or self.boundary_stop_pending:
+        if self.boundary_stop_pending or not self.feedback_active or self.angle_zero is None or self.last_encoder is None:
             return
-        def done(result):
-            token, state = result
-            self.boundary_stop_token = token
-            self.boundary_stop_pending = state == 1
-            if state == 1:
-                self.status.set("Stop cycle accepted; waiting for Position 2 to finish.")
-            elif state == 2:
-                self.set_cycle_request("stopped")
-                self.status.set("NanoJ reports cycle complete and stop requested; check motion.")
-            else:
-                self.boundary_stop_token = None
-                self.status.set("NanoJ did not accept stop cycle: no active position cycle.")
-        self.run("Requesting stop at cycle end…", self.conn.request_cycle_boundary_stop, done)
+        self.boundary_stop_pending = True
+        self.boundary_stop_anchor = self.unwrapped_counts
+        self.boundary_stop_target = None
+        self.boundary_stop_direction = None
+        self.boundary_stop_armed_at = time.monotonic()
+        self.status.set("Stop armed: software will request stop after the next zero crossing.")
+        if self.feedback_timer is not None:
+            self.after_cancel(self.feedback_timer)
+            self.feedback_timer = None
+        # An in-flight read will schedule its own next sample on completion.
+        if not (self.busy and self.active_quiet):
+            self.schedule_feedback(0)
+        self.update_controls()
 
     def cycle_request_failed(self):
         self.set_cycle_request(None)
@@ -717,6 +691,13 @@ class App(tk.Tk):
         self.encoder.set("—")
         self.angle.set("—")
         self.angle_zero = None
+        self.last_encoder = None
+        self.unwrapped_counts = 0
+        self.boundary_stop_pending = False
+        self.boundary_stop_anchor = None
+        self.boundary_stop_target = None
+        self.boundary_stop_direction = None
+        self.boundary_stop_armed_at = None
         self.velocity.set("—")
         self.velocity_samples.clear()
 
@@ -737,8 +718,10 @@ class App(tk.Tk):
         self.schedule_feedback(0)
         self.update_controls()
 
-    def schedule_feedback(self, delay=500):
+    def schedule_feedback(self, delay=None):
         if self.feedback_active and not self.closing:
+            if delay is None:
+                delay = 100 if self.boundary_stop_pending else 500
             self.feedback_timer = self.after(delay, self.read_feedback)
 
     def read_feedback(self):
@@ -750,45 +733,56 @@ class App(tk.Tk):
             return
         def work():
             values = self.conn.read_feedback()
+            sampled_at = time.monotonic()
             try:
                 state = self.conn.nanoj_status()
             except Exception as exc:
                 state = (None, str(exc))
-            boundary = None
-            if self.boundary_stop_token is not None:
-                try:
-                    boundary = self.conn.read_boundary_stop_status()
-                except Exception:
-                    boundary = (None, None)
-            return values, state, boundary
+            return values, state, sampled_at
         def done(result):
             if self.feedback_active and not self.closing:
-                values, state, boundary = result
+                values, state, sampled_at = result
                 encoder, velocity = values
                 self.set_if_changed(self.encoder, str(encoder))
+                crossed_zero = self.update_encoder_phase(encoder, sampled_at)
                 if self.angle_zero is not None:
                     angle = ((encoder - self.angle_zero) % ENCODER_COUNTS_PER_MOTOR_REVOLUTION) * 360 / ENCODER_COUNTS_PER_MOTOR_REVOLUTION
                     self.set_if_changed(self.angle, f"{angle:.2f}")
                 self.velocity_samples.append(velocity)
                 self.set_if_changed(self.velocity, f"{sum(self.velocity_samples) / len(self.velocity_samples) / 10:.1f}")
                 self.show_nanoj_status(state)
-                if boundary is not None and self.boundary_stop_token is not None:
-                    ack, stop_state = boundary
-                    if ack == self.boundary_stop_token and stop_state == 2:
-                        self.boundary_stop_token = None
-                        self.boundary_stop_pending = False
-                        self.set_cycle_request("stopped")
-                        self.status.set("NanoJ reports cycle complete and stop requested; check motion.")
-                        self.update_controls()
-                    elif ack != self.boundary_stop_token or stop_state not in (1, 2):
-                        self.boundary_stop_token = None
-                        self.boundary_stop_pending = False
-                        self.boundary_stop_supported = False
-                        self.status.set("Cycle-stop status lost or cancelled; check motion.")
-                        self.update_controls()
+                if crossed_zero and self.boundary_stop_pending:
+                    self.stop_cycle()
                 self.set_if_changed(self.feedback_status, "Live · velocity averaged over up to 10 samples.")
                 self.schedule_feedback()
         self.run("", work, done, quiet=True)
+
+    def update_encoder_phase(self, encoder, sampled_at=None):
+        if self.angle_zero is None or self.last_encoder is None:
+            return False
+        # 0x6063 is a signed 32-bit counter. Unwrap its rollover between reads.
+        delta = ((encoder - self.last_encoder + (1 << 31)) % (1 << 32)) - (1 << 31)
+        previous = self.unwrapped_counts
+        self.unwrapped_counts += delta
+        self.last_encoder = encoder
+        if (self.boundary_stop_pending and sampled_at is not None and
+                self.boundary_stop_armed_at is not None and sampled_at < self.boundary_stop_armed_at):
+            # This read completed before the button was pressed; its result is
+            # only the new starting point, never a post-request crossing.
+            self.boundary_stop_anchor = self.unwrapped_counts
+            self.boundary_stop_target = None
+            self.boundary_stop_direction = None
+            return False
+        if not self.boundary_stop_pending or delta == 0:
+            return False
+        direction = 1 if delta > 0 else -1
+        if direction != self.boundary_stop_direction:
+            reference = self.boundary_stop_anchor if self.boundary_stop_direction is None else previous
+            count = ENCODER_COUNTS_PER_MOTOR_REVOLUTION
+            self.boundary_stop_target = ((reference // count) + 1) * count if direction > 0 else ((reference - 1) // count) * count
+            self.boundary_stop_direction = direction
+        return (self.unwrapped_counts >= self.boundary_stop_target if direction > 0
+                else self.unwrapped_counts <= self.boundary_stop_target)
 
     @staticmethod
     def set_if_changed(variable, value):
@@ -802,14 +796,10 @@ class App(tk.Tk):
             self.cycle_status.set("Cycle state unknown. Check NanoJ and the platform before starting.")
         if status is None or not (status & 1) or status & 4 or error:
             was_pending = self.boundary_stop_pending
-            changed = self.boundary_stop_supported or was_pending
-            self.boundary_stop_supported = False
             self.boundary_stop_pending = False
-            self.boundary_stop_token = None
-            if changed:
-                self.update_controls()
             if was_pending:
-                self.status.set("Cycle-stop confirmation lost; check motion and reconnect.")
+                self.update_controls()
+                self.status.set("Stop-at-zero cancelled: NanoJ status unavailable. Check motion.")
         if status is None:
             self.set_if_changed(self.nanoj_state, f"NanoJ status unavailable: {error}")
         elif status & 4 or error:
@@ -819,18 +809,8 @@ class App(tk.Tk):
 
     def control_nanoj(self, running):
         self.nanoj_state.set("Sending NanoJ command…")
-        def work():
-            state = self.conn.set_nanoj_running(running)
-            try:
-                supported = self.conn.supports_cycle_boundary_stop() if running else False
-            except Exception:
-                supported = False
-            return state, supported
-        def done(result):
-            state, supported = result
-            self.boundary_stop_supported = supported
+        def done(state):
             self.boundary_stop_pending = False
-            self.boundary_stop_token = None
             self.set_cycle_request(None)
             self.show_nanoj_status(state)
             status, error = state
@@ -838,13 +818,11 @@ class App(tk.Tk):
                 self.status.set("NanoJ command sent; check status. Cycle state unknown.")
             else:
                 self.status.set("NanoJ " + ("started" if running else "stopped") + "; cycle state unknown.")
-        self.run("Sending NanoJ command…", work, done)
+        self.run("Sending NanoJ command…", lambda: self.conn.set_nanoj_running(running), done)
 
     def close_connection(self):
         self.stop_feedback()
-        self.boundary_stop_supported = False
         self.boundary_stop_pending = False
-        self.boundary_stop_token = None
         self.set_cycle_request(None)
         self.speed1.set("")
         self.speed2.set("")
@@ -859,7 +837,7 @@ class App(tk.Tk):
         self.stop_feedback()
         if self.busy:
             # Keep an already-requested cycle stop; cancel other queued actions.
-            if self.pending_action is not None and self.pending_action[0] not in ("Sending cycle stop…", "Requesting stop at cycle end…"):
+            if self.pending_action is not None and self.pending_action[0] != "Sending cycle stop…":
                 self.pending_action = None
             self.closing = True
             self.status.set("Waiting for the current operation before closing…")
