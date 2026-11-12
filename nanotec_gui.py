@@ -198,8 +198,17 @@ class Connection:
         if requested_mode != active_mode or displayed_mode != (3 if requested_mode else 1):
             status = checked(self.api.readNumber(self.handle, nl.OdIndex(0x6041, 0)), "Read drive status")
             velocity = checked(self.api.readNumber(self.handle, nl.OdIndex(0x606C, 0)), "Read actual velocity")
-            if status & 0x6F != 0x23 or velocity != 0:
-                raise RuntimeError("Stop the motor and wait for it to stand still before changing between continuous and position modes.")
+            drive_state = status & 0x6F
+            details = f"Drive status 0x{status & 0xFFFF:04X}; velocity {velocity / 10:.1f} rpm; active mode {displayed_mode}."
+            switch_on_disabled = status & 0x4F == 0x40
+            if not (switch_on_disabled or drive_state in (0x21, 0x23)) or velocity != 0:
+                raise RuntimeError("Stop the motor with IMMEDIATE STOP and wait for zero velocity before changing modes. " + details)
+            if switch_on_disabled or drive_state == 0x21:
+                out_mappings = [checked(self.api.readNumber(self.handle, nl.OdIndex(0x2320, sub)),
+                                        "Read NanoJ output mapping") for sub in range(1, 17)]
+                if (0x25000220 not in out_mappings or
+                        checked(self.api.readNumber(self.handle, nl.OdIndex(0x2500, 2)), "Read NanoJ guard version") != 20261112):
+                    raise RuntimeError("Upload the latest NanoJ program to start from this stopped drive state. " + details)
         if validate_only:
             return
         try:
